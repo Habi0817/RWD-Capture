@@ -1,0 +1,7 @@
+import assert from 'node:assert/strict';
+import {createServer} from 'node:http';
+const fixture=createServer((_q,s)=>{s.setHeader('Set-Cookie','testLogin=1; Path=/');s.end('<script>localStorage.setItem("login","yes");sessionStorage.setItem("session","yes")</script><h1>Login saved</h1>')});
+await new Promise<void>(r=>fixture.listen(4319,'127.0.0.1',r));
+async function api(p:string,method='GET',body?:unknown){const r=await fetch('http://127.0.0.1:4317/api/'+p,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const v=await r.json();assert.ok(r.ok,JSON.stringify(v));return v}
+try{for(const name of ['chrome','msedge']){await api(`auth/${name}/open`,'POST',{url:'http://127.0.0.1:4319'});await new Promise(r=>setTimeout(r,500));await api(`auth/${name}/save`,'POST');assert.ok((await api('auth')).find((a:any)=>a.name===name).saved);}
+const j=await api('jobs','POST',{url:'http://127.0.0.1:4319',profiles:['chrome','msedge'],resolutions:['mobile-375'],useAuth:true});let done;for(let i=0;i<90;i++){done=(await api('jobs')).find((v:any)=>v.id===j.id);if(!['running','queued'].includes(done.status))break;await new Promise(r=>setTimeout(r,1000))}assert.equal(done.status,'completed');for(const name of ['chrome','msedge'])await api(`auth/${name}`,'DELETE');assert.ok((await api('auth')).every((a:any)=>!a.saved));console.log('PASS: both login windows, save, authenticated jobs, clear');}finally{fixture.close()}
