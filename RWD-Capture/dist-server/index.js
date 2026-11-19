@@ -71,6 +71,7 @@ app.post('/api/auth/:name/save', async (q, s) => {
 app.delete('/api/auth/:name', async (q, s) => { if (!(await config()).profiles.some(p => p.name === q.params.name))
     throw Error('設定不存在'); await auth.get(q.params.name)?.browser.close(); auth.delete(q.params.name); await fs.rm(statePath(q.params.name), { force: true }); s.json({ ok: true }); });
 const jobs = new Map(), running = new Map();
+const deleting = new Set();
 const writes = new Map();
 async function persist(j) { const snapshot = JSON.stringify(j, null, 2); const next = (writes.get(j.id) ?? Promise.resolve()).catch(() => { }).then(async () => { const file = path.join(captures, j.id, 'manifest.json'); await fs.writeFile(file + '.tmp', snapshot); await fs.rename(file + '.tmp', file); }); writes.set(j.id, next); await next; }
 async function prepare(context, j, p) { if (!j.useAuth)
@@ -223,7 +224,7 @@ async function run(job) {
 }
 let starting = false;
 async function startBatch(makeJob) {
-    if (starting || running.size)
+    if (starting || deleting.size || running.size)
         throw Error('請先完成或取消目前工作');
     starting = true;
     try {
@@ -284,6 +285,30 @@ app.post('/api/jobs/:id/retry', async (req, res) => {
     const id = path.basename(req.params.id);
     res.json(await startBatch(async () => jobs.get(id) ??
         JSON.parse(await fs.readFile(path.join(captures, id, 'manifest.json'), 'utf8'))));
+});
+app.delete('/api/jobs/:id', async (req, res) => {
+    const id = req.params.id;
+    if (!/^[A-Za-z0-9_-]+$/.test(id))
+        throw Error('無效的歷史紀錄');
+    if (starting || running.has(id) || deleting.has(id)) {
+        res.status(409).json({ error: '工作正在執行或處理中，請稍後再刪除' });
+        return;
+    }
+    const directory = path.resolve(captures, id);
+    if (path.dirname(directory) !== path.resolve(captures))
+        throw Error('無效的輸出路徑');
+    deleting.add(id);
+    try {
+        await writes.get(id);
+        await fs.access(path.join(directory, 'manifest.json'));
+        await fs.rm(directory, { recursive: true });
+        jobs.delete(id);
+        writes.delete(id);
+        res.json({ ok: true });
+    }
+    finally {
+        deleting.delete(id);
+    }
 });
 app.post('/api/jobs/:id/folder', async (q, s) => { const target = path.join(captures, path.basename(q.params.id)); await fs.access(path.join(target, 'manifest.json')); execFile('explorer.exe', [target]); s.json({ ok: true }); });
 app.post('/api/jobs/:id/export', async (q, s) => { const id = path.basename(q.params.id); if (running.has(id))

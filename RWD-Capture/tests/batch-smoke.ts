@@ -88,6 +88,8 @@ try {
     const posted = page.waitForResponse(r=>r.url()===origin+'/api/jobs' && r.request().method()==='POST');
     await page.getByRole('button',{name:/開始擷取/}).click();
     const job = await (await posted).json();
+    const blocked = await fetch(origin + '/api/jobs/' + job.id, {method:'DELETE'});
+    assert.equal(blocked.status, 409);
     const first = await waitFor(job.id, 'partial');
     assert.ok(synchronized);
     assert.deepEqual(first.urls, urls);
@@ -113,6 +115,19 @@ try {
     const legacy = await api('jobs',{url:urls[0],profiles:['msedge'],resolutions:['手機 375']});
     const single = await waitFor(legacy.id,'completed');
     assert.match(single.items[0].file,/^msedge\//);
+    await page.getByRole('button', {name:'歷史紀錄', exact:true}).click();
+    const deletion = page.getByRole('button', {name:'刪除紀錄 ' + urls[0], exact:true}).first();
+    page.once('dialog', dialog => dialog.dismiss());
+    await deletion.click();
+    assert.equal((await api('jobs')).length, 2);
+    page.once('dialog', dialog => dialog.accept());
+    const removed = page.waitForResponse(r => r.request().method() === 'DELETE');
+    await deletion.click();
+    assert.equal((await removed).status(), 200);
+    const remaining = await api('jobs');
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].id, job.id);
+    assert.equal((await fetch(origin + '/captures/' + legacy.id + '/' + single.items[0].file)).status,404);
     console.log('PASS: concurrent URLs, partial failure, isolated retry, Vue results, legacy single URL on Edge');
   } finally { await browser.close(); }
 } finally {

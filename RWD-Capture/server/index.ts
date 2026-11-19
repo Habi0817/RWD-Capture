@@ -29,6 +29,7 @@ app.delete('/api/auth/:name',async(q,s)=>{if(!(await config()).profiles.some(p=>
 type Item={url?:string,profile:string,resolution:string,status:string,attempt:number,file?:string,error?:string,warnings:string[],meta?:unknown};
 type Job={id:string,urls?:string[],url:string,status:string,created:string,items:Item[],config:Config,useAuth:boolean};
 const jobs=new Map<string,Job>(),running=new Map<string,Set<Browser>>();
+const deleting = new Set<string>();
 const writes=new Map<string,Promise<void>>();
 async function persist(j:Job){const snapshot=JSON.stringify(j,null,2);const next=(writes.get(j.id)??Promise.resolve()).catch(()=>{}).then(async()=>{const file=path.join(captures,j.id,'manifest.json');await fs.writeFile(file+'.tmp',snapshot);await fs.rename(file+'.tmp',file)});writes.set(j.id,next);await next}
 async function prepare(context:BrowserContext,j:Job,p:string){if(!j.useAuth)return;const state=JSON.parse(await fs.readFile(statePath(p),'utf8'));await context.addInitScript(sessions=>{const values=sessions[location.origin];if(values)for(const [k,v]of Object.entries(values))sessionStorage.setItem(k,String(v))},state.sessions)}
@@ -83,7 +84,7 @@ async function run(job: Job) {
 
 let starting = false;
 async function startBatch(makeJob: () => Promise<Job>) {
-  if (starting || running.size) throw Error('請先完成或取消目前工作');
+  if (starting || deleting.size || running.size) throw Error('請先完成或取消目前工作');
   starting = true;
   try {
     const job = await makeJob();
@@ -130,6 +131,27 @@ app.post('/api/jobs/:id/retry', async (req, res) => {
   const id = path.basename(req.params.id);
   res.json(await startBatch(async () => jobs.get(id) ??
     JSON.parse(await fs.readFile(path.join(captures, id, 'manifest.json'), 'utf8'))));
+});
+app.delete('/api/jobs/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) throw Error('無效的歷史紀錄');
+  if (starting || running.has(id) || deleting.has(id)) {
+    res.status(409).json({error:'工作正在執行或處理中，請稍後再刪除'});
+    return;
+  }
+  const directory = path.resolve(captures, id);
+  if (path.dirname(directory) !== path.resolve(captures)) throw Error('無效的輸出路徑');
+  deleting.add(id);
+  try {
+    await writes.get(id);
+    await fs.access(path.join(directory, 'manifest.json'));
+    await fs.rm(directory, {recursive:true});
+    jobs.delete(id);
+    writes.delete(id);
+    res.json({ok:true});
+  } finally {
+    deleting.delete(id);
+  }
 });
 app.post('/api/jobs/:id/folder',async(q,s)=>{const target=path.join(captures,path.basename(q.params.id));await fs.access(path.join(target,'manifest.json'));execFile('explorer.exe',[target]);s.json({ok:true})});
 app.post('/api/jobs/:id/export',async(q,s)=>{const id=path.basename(q.params.id);if(running.has(id))throw Error('請等待工作完成後再匯出');const source=path.join(captures,id);await fs.access(path.join(source,'manifest.json'));if(typeof q.body.folder!=='string'||!path.isAbsolute(q.body.folder))throw Error('請輸入完整的本機資料夾路徑');const target=path.join(path.resolve(q.body.folder),id);if(target.startsWith(source+path.sep)||target===source)throw Error('請選擇其他輸出資料夾');await fs.mkdir(q.body.folder,{recursive:true});await fs.mkdir(target);await fs.cp(source,target,{recursive:true,errorOnExist:true,force:false});s.json({path:target})});
