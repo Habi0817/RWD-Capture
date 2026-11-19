@@ -1,3 +1,4 @@
+import { parseTargets } from './targets.js';
 import express from 'express';
 import { chromium } from 'playwright';
 import { promises as fs } from 'node:fs';
@@ -18,10 +19,15 @@ async function config() { return schema.parse(JSON.parse(await fs.readFile(confi
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 // Local UI is the only permitted mutation source; reject cross-site form and fetch requests.
-app.use((req, res, next) => { const origin = req.headers.origin; if (!['127.0.0.1:4317', 'localhost:4317'].includes(req.headers.host || '') || (origin && !['http://127.0.0.1:4317', 'http://localhost:4317'].includes(origin))) {
-    res.status(403).json({ error: '僅允許本機介面存取' });
-    return;
-} next(); });
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const hosts = ['127.0.0.1', 'localhost'].map(host => host + ':' + req.socket.localPort);
+    if (!hosts.includes(req.headers.host || '') || (origin && !hosts.some(host => origin === 'http://' + host))) {
+        res.status(403).json({ error: '僅允許本機介面存取' });
+        return;
+    }
+    next();
+});
 app.get('/api/config', async (_q, s) => s.json(await config()));
 app.put('/api/config', async (q, s) => { const c = schema.parse(q.body); await fs.writeFile(configPath, JSON.stringify(c, null, 2)); s.json(c); });
 function url(value) { const u = new URL(String(value)); if (!['http:', 'https:'].includes(u.protocol))
@@ -74,7 +80,7 @@ async function prepare(context, j, p) { if (!j.useAuth)
 async function capture(j, item) {
     const p = j.config.profiles.find(p => p.name === item.profile), r = j.config.resolutions.find(r => r.name === item.resolution);
     for (let attempt = 1; attempt <= 2; attempt++) {
-        if (j.status === 'cancelled')
+        if (isStopping(j))
             return;
         let b;
         try {
@@ -83,7 +89,7 @@ async function capture(j, item) {
             item.warnings = [];
             b = await launch(p, j.config.settings.headed);
             running.get(j.id).add(b);
-            if (j.status === 'cancelled')
+            if (isStopping(j))
                 return;
             const saved = j.useAuth ? JSON.parse(await fs.readFile(statePath(p.name), 'utf8')).storage : undefined;
             const options = deviceOptions(p, r);
@@ -91,7 +97,7 @@ async function capture(j, item) {
             await prepare(context, j, p.name);
             const page = await context.newPage();
             page.setDefaultTimeout(30000);
-            const response = await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            const response = await page.goto(item.url ?? j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
             if (response && response.status() >= 400)
                 throw Error(`HTTP ${response.status()}`);
             if (j.config.settings.readySelector)
@@ -137,17 +143,22 @@ async function capture(j, item) {
             item.warnings.push(...warnings);
             await page.waitForTimeout(j.config.settings.extraWaitMs);
             item.status = '擷取畫面';
-            const dir = path.join(captures, j.id, p.name);
+            const folder = j.urls && j.urls.length > 1
+                ? path.posix.join('url-' + String(j.urls.indexOf(item.url) + 1).padStart(3, '0'), p.name)
+                : p.name;
+            const dir = path.join(captures, j.id, folder);
             await fs.mkdir(dir, { recursive: true });
             const filename = `${r.name}_${r.width}x${r.height}.png`;
             const buffer = await page.screenshot({ path: path.join(dir, filename), fullPage: true, animations: 'disabled', caret: 'hide', timeout: 60000 });
-            item.file = `${p.name}/${filename}`;
+            item.file = `${folder}/${filename}`;
             item.meta = { browserVersion: b.version(), browserChannel: p.browserChannel ?? 'chromium', executablePath: p.browserExecutablePath ?? null, finalUrl: page.url(), ...options, userAgent: await page.evaluate(() => navigator.userAgent), imageWidth: buffer.readUInt32BE(16), imageHeight: buffer.readUInt32BE(20), capturedAt: new Date().toISOString() };
             item.error = undefined;
             item.status = '完成';
             return;
         }
         catch (e) {
+            if (isStopping(j))
+                return;
             item.error = String(e);
             item.status = '失敗';
         }
@@ -159,41 +170,106 @@ async function capture(j, item) {
         }
     }
 }
-async function run(j) { running.set(j.id, new Set()); j.status = 'running'; try {
-    await Promise.all(j.config.profiles.map(async (p) => { for (const item of j.items.filter(i => i.profile === p.name && i.status !== '完成')) {
-        if (j.status === 'cancelled')
-            break;
-        await capture(j, item);
-        await persist(j);
-    } }));
-    if (j.status !== 'cancelled')
-        j.status = j.items.some(i => i.status === '失敗') ? 'partial' : 'completed';
-    else
-        for (const i of j.items)
-            if (!['完成', '失敗'].includes(i.status))
-                i.status = '已取消';
+function isStopping(job) {
+    return job.status === 'cancelling' || job.status === 'cancelled';
 }
-catch (e) {
-    j.status = 'failed';
-    for (const i of j.items)
-        if (i.status !== '完成') {
-            i.status = '失敗';
-            i.error = String(e);
+async function run(job) {
+    running.set(job.id, new Set());
+    job.status = 'running';
+    const queue = job.items.filter(item => item.status !== '完成');
+    for (const item of queue) {
+        item.status = '等待中';
+        delete item.error;
+    }
+    let next = 0;
+    async function worker() {
+        while (!isStopping(job) && next < queue.length) {
+            const item = queue[next++];
+            await capture(job, item);
+            await persist(job);
         }
+    }
+    try {
+        const results = await Promise.allSettled([worker(), worker()]);
+        const failure = results.find(result => result.status === 'rejected');
+        if (failure?.status === 'rejected')
+            throw failure.reason;
+        if (isStopping(job)) {
+            for (const item of queue) {
+                if (!['完成', '失敗'].includes(item.status))
+                    item.status = '已取消';
+            }
+            job.status = 'cancelled';
+        }
+        else {
+            job.status = queue.some(item => item.status === '失敗') ? 'partial' : 'completed';
+        }
+    }
+    catch (err) {
+        job.status = 'failed';
+        for (const item of queue.filter(item => item.status !== '完成')) {
+            item.status = '失敗';
+            item.error = String(err);
+        }
+    }
+    finally {
+        try {
+            await persist(job);
+        }
+        finally {
+            running.delete(job.id);
+        }
+    }
 }
-finally {
-    running.delete(j.id);
-    await persist(j);
-} }
-app.post('/api/jobs', async (q, s) => { if (running.size)
-    throw Error('請先完成或取消目前工作'); const c = await config(); c.profiles = c.profiles.filter(p => q.body.profiles?.includes(p.name)); c.resolutions = c.resolutions.filter(r => q.body.resolutions?.includes(r.name)); if (!c.profiles.length || !c.resolutions.length)
-    throw Error('至少選一個瀏覽器和尺寸'); if (q.body.useAuth)
-    for (const p of c.profiles)
-        await fs.access(statePath(p.name)); const id = new Date().toISOString().replace(/[:.]/g, '-') + '_' + randomUUID().slice(0, 8); const j = { id, url: url(q.body.url), status: 'queued', created: new Date().toISOString(), config: c, useAuth: !!q.body.useAuth, items: c.profiles.flatMap(p => c.resolutions.map(r => ({ profile: p.name, resolution: r.name, status: '等待中', attempt: 0, warnings: [] }))) }; jobs.set(id, j); await fs.mkdir(path.join(captures, id)); await persist(j); void run(j); s.json(j); });
+let starting = false;
+async function startBatch(makeJob) {
+    if (starting || running.size)
+        throw Error('請先完成或取消目前工作');
+    starting = true;
+    try {
+        const job = await makeJob();
+        jobs.set(job.id, job);
+        void run(job).catch(console.error);
+        return job;
+    }
+    finally {
+        starting = false;
+    }
+}
+app.post('/api/jobs', async (req, res) => {
+    const job = await startBatch(async () => {
+        const input = req.body;
+        const urls = parseTargets(input.urls ?? [input.url]);
+        const c = await config();
+        c.profiles = c.profiles.filter(p => input.profiles?.includes(p.name));
+        c.resolutions = c.resolutions.filter(r => input.resolutions?.includes(r.name));
+        if (!c.profiles.length || !c.resolutions.length)
+            throw Error('至少選一個瀏覽器和尺寸');
+        if (input.useAuth) {
+            for (const p of c.profiles)
+                await fs.access(statePath(p.name));
+        }
+        const created = new Date().toISOString();
+        const id = created.replace(/[:.]/g, '-') + '_' + randomUUID().slice(0, 8);
+        const items = [];
+        for (const r of c.resolutions) {
+            for (const p of c.profiles) {
+                for (const target of urls) {
+                    items.push({ url: target, profile: p.name, resolution: r.name, status: '等待中', attempt: 0, warnings: [] });
+                }
+            }
+        }
+        const job = { id, url: urls[0], urls, created, config: c, items, useAuth: !!input.useAuth, status: 'queued' };
+        await fs.mkdir(path.join(captures, id));
+        await persist(job);
+        return job;
+    });
+    res.json(job);
+});
 app.get('/api/jobs', async (_q, s) => { const result = []; for (const dir of await fs.readdir(captures)) {
     try {
         const j = jobs.get(dir) ?? JSON.parse(await fs.readFile(path.join(captures, dir, 'manifest.json'), 'utf8'));
-        if (!jobs.has(dir) && ['running', 'queued'].includes(j.status))
+        if (!jobs.has(dir) && ['running', 'queued', 'cancelling'].includes(j.status))
             j.status = 'interrupted';
         result.push(j);
     }
@@ -201,12 +277,14 @@ app.get('/api/jobs', async (_q, s) => { const result = []; for (const dir of awa
 } s.json(result.sort((a, b) => b.created.localeCompare(a.created))); });
 app.get('/api/jobs/:id/events', (q, s) => { s.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }); s.flushHeaders(); const tick = () => s.write(`data: ${JSON.stringify(jobs.get(q.params.id) ?? null)}\n\n`); tick(); const timer = setInterval(tick, 600); q.on('close', () => clearInterval(timer)); });
 app.post('/api/jobs/:id/cancel', async (q, s) => { const j = jobs.get(q.params.id); if (j && running.has(j.id)) {
-    j.status = 'cancelled';
+    j.status = 'cancelling';
     await Promise.all([...running.get(j.id)].map(b => b.close().catch(() => { })));
-    await persist(j);
 } s.json({ ok: true }); });
-app.post('/api/jobs/:id/retry', async (q, s) => { if (running.size)
-    throw Error('已有工作執行中'); const j = jobs.get(q.params.id) ?? JSON.parse(await fs.readFile(path.join(captures, path.basename(q.params.id), 'manifest.json'), 'utf8')); jobs.set(j.id, j); void run(j); s.json(j); });
+app.post('/api/jobs/:id/retry', async (req, res) => {
+    const id = path.basename(req.params.id);
+    res.json(await startBatch(async () => jobs.get(id) ??
+        JSON.parse(await fs.readFile(path.join(captures, id, 'manifest.json'), 'utf8'))));
+});
 app.post('/api/jobs/:id/folder', async (q, s) => { const target = path.join(captures, path.basename(q.params.id)); await fs.access(path.join(target, 'manifest.json')); execFile('explorer.exe', [target]); s.json({ ok: true }); });
 app.post('/api/jobs/:id/export', async (q, s) => { const id = path.basename(q.params.id); if (running.has(id))
     throw Error('請等待工作完成後再匯出'); const source = path.join(captures, id); await fs.access(path.join(source, 'manifest.json')); if (typeof q.body.folder !== 'string' || !path.isAbsolute(q.body.folder))
@@ -221,8 +299,16 @@ if (process.env.NODE_ENV === 'development') {
 else
     app.use(express.static(path.join(root, 'dist')));
 app.use((err, _q, s, _n) => { console.error(err); s.status(400).json({ error: err.message ?? String(err) }); });
-const server = app.listen(4317, '127.0.0.1', () => { console.log('RWD Capture: http://127.0.0.1:4317'); if (!process.env.NO_OPEN)
-    execFile('cmd.exe', ['/c', 'start', '', 'http://127.0.0.1:4317']); });
+const server = app.listen(Number(process.env.RWD_CAPTURE_PORT ?? 4317), '127.0.0.1');
+server.on('listening', () => {
+    const address = server.address();
+    if (!address || typeof address === 'string')
+        return;
+    const origin = 'http://127.0.0.1:' + address.port;
+    console.log('RWD Capture: ' + origin);
+    if (!process.env.NO_OPEN)
+        execFile('cmd.exe', ['/c', 'start', '', origin]);
+});
 async function shutdown() { for (const a of auth.values())
     await a.browser.close().catch(() => { }); for (const bs of running.values())
     for (const b of bs)
