@@ -2,7 +2,7 @@
 import {parseTargets} from '../server/targets';
 import {ref,computed,onMounted,watchEffect} from 'vue';
 const exportFolder=ref(''); const cfg=ref<any>(null),editor=ref(''),profiles=ref<string[]>([]),sizes=ref<string[]>([]),target=ref(''),useAuth=ref(false),history=ref<any[]>([]),job=ref<any>(null),auth=ref<any[]>([]),tab=ref('capture'),error=ref(''),busy=ref(false),zoom=ref('');let events:EventSource|undefined;
-const toolName = computed(() => cfg.value?.name ?? 'RWD Capture');
+const toolName = computed(() => cfg.value?.name ?? '截圖小幫手');
 watchEffect(() => { document.title = toolName.value; });
 const selectedUrl = ref('');
 const inputTargets = computed(() => {

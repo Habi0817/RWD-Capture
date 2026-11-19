@@ -6,7 +6,7 @@ const configName = z.string()
 function uniqueNames(entries) {
     return new Set(entries.map(entry => entry.name.toLowerCase())).size === entries.length;
 }
-export const defaultToolName = 'RWD Capture';
+export const defaultToolName = '截圖小幫手';
 const toolName = z.string().trim().min(1, '請輸入工具名稱').max(80, '工具名稱最多 80 個字元');
 export const schema = z.object({ name: toolName.default(defaultToolName), profiles: z.array(z.object({ name: configName, browserChannel: z.enum(['chrome', 'msedge']).optional(), browserExecutablePath: z.string().optional(), desktopUserAgent: z.string().optional(), mobileUserAgent: z.string().optional(), ...device })).min(1), resolutions: z.array(z.object({ name: configName, width: z.number().int().min(200).max(7680), height: z.number().int().min(200).max(4320), ...device })).min(1), settings: z.object({ extraWaitMs: z.number().min(0).max(60000), readySelector: z.string(), headed: z.boolean() }).default({ extraWaitMs: 800, readySelector: '', headed: false }) }).refine(c => uniqueNames(c.profiles) && uniqueNames(c.resolutions), '名稱不能重複');
 export function deviceOptions(p, r) { const isMobile = r.isMobile ?? p.isMobile ?? r.width < 1024; return { viewport: { width: r.width, height: r.height }, screen: { width: r.width, height: r.height }, isMobile, hasTouch: r.hasTouch ?? p.hasTouch ?? isMobile, deviceScaleFactor: r.deviceScaleFactor ?? p.deviceScaleFactor ?? 1, userAgent: isMobile ? p.mobileUserAgent : p.desktopUserAgent }; }

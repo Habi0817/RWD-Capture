@@ -6,7 +6,7 @@ test('invalid resolutions and duplicate names are rejected',()=>{assert.equal(sc
 
 test('中文標題與設定名稱可保存，舊設定沿用預設標題', () => {
   const {name, ...legacy} = defaults;
-  assert.equal(schema.parse(legacy).name, 'RWD Capture');
+  assert.equal(schema.parse(legacy).name, '截圖小幫手');
   const config = schema.parse({
     ...legacy, name: '網頁截圖工具',
     profiles: [{name:'瀏覽器 Chrome', browserChannel:'chrome'}],
